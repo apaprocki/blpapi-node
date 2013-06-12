@@ -1,7 +1,8 @@
-var EventEmitter = require('events').EventEmitter;
 var util = require('util');
 var path = require('path');
-var blpapi = require(path.join(__dirname, '/build/Release/blpapijs'));
+var EventEmitter = require('events').EventEmitter;
+var Q = require('q');
+var blpapi = require(path.join(__dirname, '/build/Debug/blpapijs'));
 
 exports.Session = function(args) {
     this.session = new blpapi.Session(args);
@@ -9,28 +10,32 @@ exports.Session = function(args) {
     this.session.emit = function() {
         that.emit.apply(that, arguments);
     };
+    this.session.Q = Q;
 };
 util.inherits(exports.Session, EventEmitter);
 
 exports.Session.prototype.start =
-    function() {
-        return this.session.start();
+    function(cb) {
+        return Q.nbind(this.session.start, this.session)
+                ().nodeify(cb);
     }
 exports.Session.prototype.authorize =
     function(uri, cid) {
         return this.session.authorize(uri, cid);
     }
 exports.Session.prototype.stop =
-    function() {
-        return this.session.stop();
+    function(cb) {
+        return Q.nbind(this.session.stop, this.session)
+                ().nodeify(cb);
     }
 exports.Session.prototype.destroy =
     function() {
         return this.session.destroy();
     }
 exports.Session.prototype.openService =
-    function(uri, cid) {
-        return this.session.openService(uri, cid);
+    function(uri, cb) {
+        return Q.nbind(this.session.openService, this.session)
+                (uri).nodeify(cb);
     }
 exports.Session.prototype.subscribe =
     function(sub, label) {
@@ -45,8 +50,9 @@ exports.Session.prototype.unsubscribe =
         return this.session.unsubscribe(sub, label);
     }
 exports.Session.prototype.request =
-    function(uri, name, request, cid, label) {
-        return this.session.request(uri, name, request, cid, label);
+    function(uri, name, request, label, cb) {
+        return Q.nbind(this.session.request, this.session)
+                (uri, name, request, label).nodeify(cb);
     }
 
 // Local variables:

@@ -22,6 +22,9 @@
   "keywords": [
     "finance", "stocks", "stock", "quotes", "tick", "realtime", "market"
   ],
+  "dependencies": {
+    "q": "0.9.4"
+  },
   "license": "MIT",
   "engines": { "node": ">=0.6" }
 }

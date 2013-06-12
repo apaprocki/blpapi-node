@@ -20,6 +20,7 @@
 
 #include <deque>
 #include <sstream>
+#include <map>
 
 #include <cmath>
 #include <ctime>
@@ -48,19 +49,29 @@
 #define BLPAPI_EXCEPTION_TRY try {
 #define BLPAPI_EXCEPTION_CATCH \
     } catch (blpapi::Exception& e) { \
+        std::stringstream __catch_ss; \
+        __catch_ss << "BLPAPI Exception: " << e.description(); \
+        std::string __catch_s = __catch_ss.str(); \
         ThrowException(Exception::Error( \
-                String::New(e.description().c_str(), \
-                            e.description().length()))); \
+                String::New(__catch_s.c_str(), __catch_s.length()))); \
     }
 #define BLPAPI_EXCEPTION_CATCH_RETURN \
     } catch (blpapi::Exception& e) { \
+        std::stringstream __catch_ss; \
+        __catch_ss << "BLPAPI Exception: " << e.description(); \
+        std::string __catch_s = __catch_ss.str(); \
         return ThrowException(Exception::Error( \
-                String::New(e.description().c_str(), \
-                            e.description().length()))); \
+                String::New(__catch_s.c_str(), __catch_s.length()))); \
     }
 
 using namespace node;
 using namespace v8;
+
+#define CID_SESSION_START       1
+#define CID_SESSION_STOP        2
+
+// XXX Provide better globally unique correlation ID counter
+static int global_cid_counter = 1000;
 
 namespace BloombergLP {
 namespace blpapijs {
@@ -101,10 +112,13 @@ private:
     static void processEvents(uv_async_t *async, int status);
     void processMessage(blpapi::Event::EventType et,
                         const blpapi::Message& msg);
+    void processEvent(const blpapi::Event& ev);
+    bool processCallback(const blpapi::Event& ev);
 
     void emit(int argc, Handle<Value> argv[]);
 
     static uv_async_t s_async;
+    static Persistent<String> s_q;
     static Persistent<String> s_emit;
     static Persistent<String> s_event_type;
     static Persistent<String> s_message_type;
@@ -119,6 +133,7 @@ private:
     blpapi::Session *d_session;
     blpapi::Identity d_identity;
     Persistent<Object> d_session_ref;
+    std::map<int, Persistent<Value> > d_cbs;
     std::deque<blpapi::Event> d_que;
     uv_mutex_t d_que_mutex;
     bool d_started;
@@ -126,6 +141,7 @@ private:
 };
 
 uv_async_t Session::s_async;
+Persistent<String> Session::s_q;
 Persistent<String> Session::s_emit;
 Persistent<String> Session::s_event_type;
 Persistent<String> Session::s_message_type;
@@ -191,6 +207,7 @@ Session::Initialize(Handle<Object> target)
     uv_unref(uv_default_loop());
 #endif
 
+    s_q = NODE_PSYMBOL("Q");
     s_emit = NODE_PSYMBOL("emit");
     s_event_type = NODE_PSYMBOL("eventType");
     s_message_type = NODE_PSYMBOL("messageType");
@@ -260,6 +277,11 @@ Session::Start(const Arguments& args)
 {
     HandleScope scope;
 
+    if (args.Length() < 1 || !args[0]->IsFunction()) {
+        return ThrowException(Exception::Error(String::New(
+                "Callback must be provided as the first parameter.")));
+    }
+
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
 
     if (session->d_started)
@@ -269,13 +291,23 @@ Session::Start(const Arguments& args)
         return ThrowException(Exception::Error(String::New(
                         "Stopped sessions can not be restarted.")));
 
+    Isolate* isolate = Isolate::GetCurrent();
+
+    session->d_cbs[CID_SESSION_START] =
+#if NODE_VERSION_AT_LEAST(0, 11, 0)
+        Persistent<Value>::New(isolate, args[0]);
+#else
+        Persistent<Value>::New(args[0]);
+#endif
+
+    std::cout << "Session::Start() d_session->StartAsync()" << std::endl;
     BLPAPI_EXCEPTION_TRY
     session->d_session->startAsync();
     BLPAPI_EXCEPTION_CATCH_RETURN
 
     session->d_session_ref =
 #if NODE_VERSION_AT_LEAST(0, 11, 0)
-        Persistent<Object>::New(Isolate::GetCurrent(), args.This());
+        Persistent<Object>::New(isolate, args.This());
 #else
         Persistent<Object>::New(args.This());
 #endif
@@ -359,6 +391,11 @@ Session::Stop(const Arguments& args)
 {
     HandleScope scope;
 
+    if (args.Length() < 1 || !args[0]->IsFunction()) {
+        return ThrowException(Exception::Error(String::New(
+                "Callback must be provided as the first parameter.")));
+    }
+
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
 
     if (!session->d_started)
@@ -369,6 +406,15 @@ Session::Stop(const Arguments& args)
                         "Session has already been stopped.")));
 
     session->d_stopped = true;
+
+    Isolate* isolate = Isolate::GetCurrent();
+
+    session->d_cbs[CID_SESSION_STOP] =
+#if NODE_VERSION_AT_LEAST(0, 11, 0)
+        Persistent<Value>::New(isolate, args[0]);
+#else
+        Persistent<Value>::New(args[0]);
+#endif
 
     BLPAPI_EXCEPTION_TRY
     session->d_session->stopAsync();
@@ -411,10 +457,9 @@ Session::OpenService(const Arguments& args)
         return ThrowException(Exception::Error(String::New(
                 "Service URI string must be provided as first parameter.")));
     }
-    if (args.Length() < 2 || !args[1]->IsInt32()) {
+    if (args.Length() < 2 || !args[1]->IsFunction()) {
         return ThrowException(Exception::Error(String::New(
-                "Integer correlation identifier must be provided "
-                "as second parameter.")));
+                "Callback must be provided as the second parameter.")));
     }
     if (args.Length() > 2) {
         return ThrowException(Exception::Error(String::New(
@@ -424,16 +469,19 @@ Session::OpenService(const Arguments& args)
     Local<String> s = args[0]->ToString();
     String::Utf8Value uriv(s);
 
-    int cidi = args[1]->Int32Value();
-    blpapi::CorrelationId cid(cidi);
-
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
+
+    int cidi = ++global_cid_counter;
+    blpapi::CorrelationId cid(cidi);
+    std::cout << "Session::OpenService " << cid << std::endl;
+    session->d_cbs[cidi] =
+        Persistent<Value>::New(Isolate::GetCurrent(), args[1]);
 
     BLPAPI_EXCEPTION_TRY
     session->d_session->openServiceAsync(*uriv, cid);
     BLPAPI_EXCEPTION_CATCH_RETURN
 
-    return scope.Close(Integer::New(cidi));
+    return scope.Close(args.This());
 }
 
 void
@@ -659,21 +707,18 @@ Session::Request(const Arguments& args)
                 "Object containing request parameters must be provided "
                 "as third parameter.")));
     }
-    if (args.Length() < 4 || !args[3]->IsInt32()) {
-        return ThrowException(Exception::Error(String::New(
-                "Integer correlation identifier must be provided "
-                "as fourth parameter.")));
-    }
-    if (args.Length() >= 5 && !args[4]->IsUndefined() && !args[4]->IsString()) {
+    if (args.Length() >= 4 && !args[3]->IsUndefined() && !args[3]->IsString()) {
         return ThrowException(Exception::Error(String::New(
                 "Optional request label must be a string.")));
+    }
+    if (args.Length() < 5 || !args[4]->IsFunction()) {
+        return ThrowException(Exception::Error(String::New(
+                "Callback must be provided as the fifth parameter.")));
     }
     if (args.Length() > 5) {
         return ThrowException(Exception::Error(String::New(
                 "Function expects at most five arguments.")));
     }
-
-    int cidi = args[3]->Int32Value();
 
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
 
@@ -788,10 +833,14 @@ Session::Request(const Arguments& args)
         }
     }
 
+    int cidi = ++global_cid_counter;
     blpapi::CorrelationId cid(cidi);
+    std::cout << "Session::Request " << cid << std::endl;
+    session->d_cbs[cidi] =
+        Persistent<Value>::New(Isolate::GetCurrent(), args[4]);
 
-    if (args.Length() == 5) {
-        String::Utf8Value labelv(args[4]->ToString());
+    if (args[3]->IsString()) {
+        String::Utf8Value labelv(args[3]->ToString());
         session->d_session->sendRequest(request, session->d_identity,
                                         cid, 0, *labelv, labelv.length());
     } else {
@@ -800,7 +849,7 @@ Session::Request(const Arguments& args)
 
     BLPAPI_EXCEPTION_CATCH_RETURN
 
-    return scope.Close(Integer::New(cidi));
+    return scope.Close(args.This());
 }
 
 Handle<Value>
@@ -1065,6 +1114,167 @@ Session::processMessage(blpapi::Event::EventType et, const blpapi::Message& msg)
     this->emit(sizeof(argv) / sizeof(argv[0]), argv);
 }
 
+bool
+Session::processCallback(const blpapi::Event& ev)
+{
+#define CID_FIND(msg) \
+    std::map<int, Persistent<Value> >::iterator it = \
+        d_cbs.find(static_cast<int>(msg.correlationId().asInteger())); \
+    if (it != d_cbs.end())
+
+#define CID_PARTIAL_CALLBACK(argc, arv) \
+    Function::Cast(*it->second)->Call(handle_, argc, argv)
+
+#define CID_CALLBACK(argc, argv) \
+    CID_PARTIAL_CALLBACK(argc, argv); \
+    it->second.Dispose(); \
+    d_cbs.erase(it)
+
+    Handle<Value> argv[2];
+
+    switch (ev.eventType()) {
+        case blpapi::Event::SESSION_STATUS: {
+            // EXPECT: "SessionConnectionUp" -> "SessionStarted"
+            // EXPECT: "SessionConnectionDown" -> "SessionTerminated"
+
+            // If a SESSION_STATUS event is received asynchronously,
+            // let it fall through to the standard EventEmitter.
+
+            blpapi::MessageIterator msgIter(ev);
+            while (msgIter.next()) {
+                const blpapi::Message& msg = msgIter.message();
+                std::cout << msg << std::endl;
+
+                if (msg.messageType() == "SessionStarted") {
+                    std::map<int, Persistent<Value> >::iterator it =
+                        d_cbs.find(CID_SESSION_START);
+                    // Status change received asynchronously with no
+                    // pending callback in the map, fall through to the
+                    // standard EventEmitter.
+                    if (it == d_cbs.end()) {
+                        processMessage(ev.eventType(), msg);
+                        return true;
+                    }
+                    argv[0] = Undefined();
+                    CID_CALLBACK(1, argv);
+                } else if (msg.messageType() == "SessionTerminated") {
+                    std::map<int, Persistent<Value> >::iterator it =
+                        d_cbs.find(CID_SESSION_STOP);
+                    // Status change received asynchronously with no
+                    // pending callback in the map, fall through to the
+                    // standard EventEmitter.
+                    if (it == d_cbs.end()) {
+                        processMessage(ev.eventType(), msg);
+                        return true;
+                    }
+                    argv[0] = Undefined();
+                    CID_CALLBACK(1, argv);
+                } else if (msg.messageType() == "SessionConnectionUp" ||
+                           msg.messageType() == "SessionConnectionDown") {
+                    // SESSION_STATUS connection state messages fall
+                    // through to the standard EventEmitter.
+                    processMessage(ev.eventType(), msg);
+                } else {
+                    std::map<int, Persistent<Value> >::iterator it =
+                        d_cbs.find(CID_SESSION_START);
+                    if (it == d_cbs.end())
+                        it = d_cbs.find(CID_SESSION_STOP);
+                    // Error case when no outstanding start/stop callback
+                    // is found, fall through to standard EventEmitter.
+                    if (it == d_cbs.end()) {
+                        return true;
+                    }
+                    // Anything else is a failure.
+                    argv[0] = Exception::Error(String::New(
+                                "Unsupported session status."));
+                    CID_CALLBACK(1, argv);
+                }
+                break;
+            }
+            return true;
+        }
+        case blpapi::Event::SERVICE_STATUS: {
+            // EXPECT: "ServiceOpened"
+
+            blpapi::MessageIterator msgIter(ev);
+            while (msgIter.next()) {
+                const blpapi::Message& msg = msgIter.message();
+                std::cout << msg << std::endl;
+
+                CID_FIND(msg) {
+                    // Anything other than "ServiceOpened" is a failure.
+                    if (msg.messageType() == "ServiceOpened") {
+                        argv[0] = Undefined();
+                    } else {
+                        argv[0] = Exception::Error(String::New(
+                                    "Failed to open service."));
+                    }
+                    CID_CALLBACK(1, argv);
+                    return true;
+                }
+            }
+            break;
+        }
+        case blpapi::Event::PARTIAL_RESPONSE: {
+
+            Local<Value> q = handle_->Get(s_q);
+            std::cout << "q IsObject " << q->IsObject() << std::endl;
+            break;
+        }
+        case blpapi::Event::RESPONSE: {
+
+            blpapi::MessageIterator msgIter(ev);
+            while (msgIter.next()) {
+                const blpapi::Message& msg = msgIter.message();
+                CID_FIND(msg) {
+                    Local<Object> o = Object::New();
+                    o->Set(s_event_type, eventTypeToString(ev.eventType()),
+                           (PropertyAttribute)(ReadOnly | DontDelete));
+                    const blpapi::Name& messageType = msg.messageType();
+                    o->Set(s_message_type,
+                           String::New(messageType.string(),
+                                       messageType.length()),
+                           (PropertyAttribute)(ReadOnly | DontDelete));
+                    o->Set(s_topic_name, String::New(msg.topicName()),
+                           (PropertyAttribute)(ReadOnly | DontDelete));
+                    o->Set(s_data, elementToValue(msg.asElement()));
+
+                    argv[0] = Undefined();
+                    argv[1] = o;
+
+                    if (blpapi::Event::RESPONSE == ev.eventType()) {
+                        CID_CALLBACK(2, argv);
+                    } else {
+                        CID_PARTIAL_CALLBACK(2, argv);
+                    }
+                    return true;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return false;
+}
+
+void
+Session::processEvent(const blpapi::Event& ev)
+{
+    // Attempt to match up the event to a registered callback.  If the
+    // event does not correspond to a callback, fall through and emit the
+    // messages for all to consume.
+    if (processCallback(ev))
+        return;
+
+    // Iterate over contained messages without holding lock
+    blpapi::MessageIterator msgIter(ev);
+    while (msgIter.next()) {
+        const blpapi::Message& msg = msgIter.message();
+        processMessage(ev.eventType(), msg);
+    }
+}
+
 void
 Session::processEvents(uv_async_t *async, int status)
 {
@@ -1086,12 +1296,8 @@ Session::processEvents(uv_async_t *async, int status)
         const blpapi::Event& ev = session->d_que.front();
         uv_mutex_unlock(&session->d_que_mutex);
 
-        // Iterate over contained messages without holding lock
-        blpapi::MessageIterator msgIter(ev);
-        while (msgIter.next()) {
-            const blpapi::Message& msg = msgIter.message();
-            session->processMessage(ev.eventType(), msg);
-        }
+        // Process the event without holding the lock
+        session->processEvent(ev);
 
         // Reacquire and pop, updating empty flag to having to
         // loop and acquire the mutex for a second time.
