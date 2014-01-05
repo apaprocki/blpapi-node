@@ -67,6 +67,14 @@
 using namespace node;
 using namespace v8;
 
+#if NODE_VERSION_AT_LEAST(0, 11, 0)
+#define CID_REGISTER(session, cid, cb) \
+    session->d_cbs[cid] = \
+        Persistent<Value>::New(Isolate::GetCurrent(), cb)
+#else
+#define CID_REGISTER(session, cid, cb) \
+    session->d_cbs[cid] = Persistent<Value>::New(cb)
+#endif
 #define CID_SESSION_START       1
 #define CID_SESSION_STOP        2
 
@@ -291,14 +299,7 @@ Session::Start(const Arguments& args)
         return ThrowException(Exception::Error(String::New(
                         "Stopped sessions can not be restarted.")));
 
-    Isolate* isolate = Isolate::GetCurrent();
-
-    session->d_cbs[CID_SESSION_START] =
-#if NODE_VERSION_AT_LEAST(0, 11, 0)
-        Persistent<Value>::New(isolate, args[0]);
-#else
-        Persistent<Value>::New(args[0]);
-#endif
+    CID_REGISTER(session, CID_SESSION_START, args[0]);
 
     std::cout << "Session::Start() d_session->StartAsync()" << std::endl;
     BLPAPI_EXCEPTION_TRY
@@ -307,7 +308,7 @@ Session::Start(const Arguments& args)
 
     session->d_session_ref =
 #if NODE_VERSION_AT_LEAST(0, 11, 0)
-        Persistent<Object>::New(isolate, args.This());
+        Persistent<Object>::New(Isolate::GetCurrent(), args.This());
 #else
         Persistent<Object>::New(args.This());
 #endif
@@ -330,9 +331,13 @@ Session::Authorize(const Arguments& args)
                 "Integer correlation identifier must be provided "
                 "as second parameter.")));
     }
-    if (args.Length() > 2) {
+    if (args.Length() < 3 || !args[2]->IsFunction()) {
         return ThrowException(Exception::Error(String::New(
-                "Function expects at most two arguments.")));
+                "Callback must be provided as the third parameter.")));
+    }
+    if (args.Length() > 3) {
+        return ThrowException(Exception::Error(String::New(
+                "Function expects at most three arguments.")));
     }
 
     Local<String> s = args[0]->ToString();
@@ -341,6 +346,8 @@ Session::Authorize(const Arguments& args)
     int cidi = args[1]->Int32Value();
 
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
+
+    CID_REGISTER(session, cidi, args[2]);
 
     BLPAPI_EXCEPTION_TRY
 
@@ -407,14 +414,7 @@ Session::Stop(const Arguments& args)
 
     session->d_stopped = true;
 
-    Isolate* isolate = Isolate::GetCurrent();
-
-    session->d_cbs[CID_SESSION_STOP] =
-#if NODE_VERSION_AT_LEAST(0, 11, 0)
-        Persistent<Value>::New(isolate, args[0]);
-#else
-        Persistent<Value>::New(args[0]);
-#endif
+    CID_REGISTER(session, CID_SESSION_STOP, args[0]);
 
     BLPAPI_EXCEPTION_TRY
     session->d_session->stopAsync();
@@ -473,9 +473,8 @@ Session::OpenService(const Arguments& args)
 
     int cidi = ++global_cid_counter;
     blpapi::CorrelationId cid(cidi);
-    std::cout << "Session::OpenService " << cid << std::endl;
-    session->d_cbs[cidi] =
-        Persistent<Value>::New(Isolate::GetCurrent(), args[1]);
+
+    CID_REGISTER(session, cidi, args[1]);
 
     BLPAPI_EXCEPTION_TRY
     session->d_session->openServiceAsync(*uriv, cid);
@@ -563,14 +562,16 @@ Session::subscribe(const Arguments& args, int action)
         return ThrowException(Exception::Error(String::New(
                 "Array of subscription information must be provided.")));
     }
-    if (args.Length() >= 2 && !args[1]->IsUndefined() && !args[1]->IsString()) {
+    if (args.Length() < 2 && !args[1]->IsUndefined() && !args[1]->IsString()) {
         return ThrowException(Exception::Error(String::New(
-                "Optional subscription label must be a string.")));
+                "Subscription label must be a string.")));
     }
-    if (args.Length() > 2) {
+    if (args.Length() < 3 && !args[2]->IsFunction()) {
         return ThrowException(Exception::Error(String::New(
-                "Function expects at most two arguments.")));
+                "Callback must be provided as the third parameter.")));
     }
+
+    Session* session = ObjectWrap::Unwrap<Session>(args.This());
 
     blpapi::SubscriptionList sl;
 
@@ -622,16 +623,16 @@ Session::subscribe(const Arguments& args, int action)
             return ThrowException(Exception::Error(String::New(
                         "Property 'correlation' must be an integer.")));
         }
-        int correlation = iv->Int32Value();
+        int cidi = iv->Int32Value();
 
         sl.add(*secv, fields.c_str(), options.c_str(),
-               blpapi::CorrelationId(correlation));
+               blpapi::CorrelationId(cidi));
+
+        CID_REGISTER(session, cidi, args[2]);
     }
 
-    Session* session = ObjectWrap::Unwrap<Session>(args.This());
-
     BLPAPI_EXCEPTION_TRY
-    if (args.Length() == 2) {
+    if (args[1]->IsString()) {
         Local<String> s = args[1]->ToString();
         String::Utf8Value labelv(s);
         if (action == 1)
@@ -835,9 +836,8 @@ Session::Request(const Arguments& args)
 
     int cidi = ++global_cid_counter;
     blpapi::CorrelationId cid(cidi);
-    std::cout << "Session::Request " << cid << std::endl;
-    session->d_cbs[cidi] =
-        Persistent<Value>::New(Isolate::GetCurrent(), args[4]);
+
+    CID_REGISTER(session, cidi, args[4]);
 
     if (args[3]->IsString()) {
         String::Utf8Value labelv(args[3]->ToString());
@@ -1145,7 +1145,8 @@ Session::processCallback(const blpapi::Event& ev)
                 const blpapi::Message& msg = msgIter.message();
                 std::cout << msg << std::endl;
 
-                if (msg.messageType() == "SessionStarted") {
+                if (msg.messageType() == "SessionStarted" ||
+                    msg.messageType() == "SessionStartupFailure") {
                     std::map<int, Persistent<Value> >::iterator it =
                         d_cbs.find(CID_SESSION_START);
                     // Status change received asynchronously with no
@@ -1155,7 +1156,12 @@ Session::processCallback(const blpapi::Event& ev)
                         processMessage(ev.eventType(), msg);
                         return true;
                     }
-                    argv[0] = Undefined();
+                    if (msg.messageType() == "SessionStarted") {
+                        argv[0] = Undefined();
+                    } else {
+                        argv[0] = Exception::Error(String::New(
+                                    "Failed to connect."));
+                    }
                     CID_CALLBACK(1, argv);
                 } else if (msg.messageType() == "SessionTerminated") {
                     std::map<int, Persistent<Value> >::iterator it =
@@ -1174,6 +1180,16 @@ Session::processCallback(const blpapi::Event& ev)
                     // SESSION_STATUS connection state messages fall
                     // through to the standard EventEmitter.
                     processMessage(ev.eventType(), msg);
+                } else if (msg.messageType() == "AuthorizationSuccess") {
+                    CID_FIND(msg);
+                    argv[0] = Undefined();
+                    CID_CALLBACK(1, argv);
+                } else if (msg.messageType() == "AuthorizationFailure") {
+                    CID_FIND(msg);
+                    // XXX add failure message to exception text.
+                    argv[0] = Exception::Error(String::New(
+                                "Failed to authorize."));
+                    CID_CALLBACK(1, argv);
                 } else {
                     std::map<int, Persistent<Value> >::iterator it =
                         d_cbs.find(CID_SESSION_START);
@@ -1215,17 +1231,13 @@ Session::processCallback(const blpapi::Event& ev)
             }
             break;
         }
-        case blpapi::Event::PARTIAL_RESPONSE: {
-
-            Local<Value> q = handle_->Get(s_q);
-            std::cout << "q IsObject " << q->IsObject() << std::endl;
-            break;
-        }
+        case blpapi::Event::PARTIAL_RESPONSE:
         case blpapi::Event::RESPONSE: {
 
             blpapi::MessageIterator msgIter(ev);
             while (msgIter.next()) {
                 const blpapi::Message& msg = msgIter.message();
+                std::cout << msg << std::endl;
                 CID_FIND(msg) {
                     Local<Object> o = Object::New();
                     o->Set(s_event_type, eventTypeToString(ev.eventType()),
@@ -1242,10 +1254,10 @@ Session::processCallback(const blpapi::Event& ev)
                     argv[0] = Undefined();
                     argv[1] = o;
 
+                    CID_PARTIAL_CALLBACK(2, argv);
                     if (blpapi::Event::RESPONSE == ev.eventType()) {
+                        argv[1] = Undefined();
                         CID_CALLBACK(2, argv);
-                    } else {
-                        CID_PARTIAL_CALLBACK(2, argv);
                     }
                     return true;
                 }

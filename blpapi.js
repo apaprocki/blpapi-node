@@ -20,8 +20,9 @@ exports.Session.prototype.start =
                 ().nodeify(cb);
     }
 exports.Session.prototype.authorize =
-    function(uri, cid) {
-        return this.session.authorize(uri, cid);
+    function(uri, cid, cb) {
+        return Q.nbind(this.session.authorize, this.session)
+                (uri, cid).nodeify(cb);
     }
 exports.Session.prototype.stop =
     function(cb) {
@@ -38,12 +39,14 @@ exports.Session.prototype.openService =
                 (uri).nodeify(cb);
     }
 exports.Session.prototype.subscribe =
-    function(sub, label) {
-        return this.session.subscribe(sub, label);
+    function(sub, label, cb) {
+        return Q.nbind(this.session.subscribe, this.session)
+                (sub, label).nodeify(cb);
     }
 exports.Session.prototype.resubscribe =
-    function(sub, label) {
-        return this.session.resubscribe(sub, label);
+    function(sub, label, cb) {
+        return Q.nbind(this.session.resubscribe, this.session)
+                (sub, label).nodeify(cb);
     }
 exports.Session.prototype.unsubscribe =
     function(sub, label) {
@@ -51,8 +54,24 @@ exports.Session.prototype.unsubscribe =
     }
 exports.Session.prototype.request =
     function(uri, name, request, label, cb) {
-        return Q.nbind(this.session.request, this.session)
-                (uri, name, request, label).nodeify(cb);
+        var current = Q.defer();
+        var handle = {
+            // When 'current' is set to 'undefined', it indicates that there are
+            // no more responses and 'readResponse' should return 'undefined'.
+            readResponse: function(cb) {
+                return current ? current.promise : Q(undefined);
+            }
+        };
+        this.session.request(uri, name, request, label,
+            function(err, response) {
+                if (err) {
+                    current.reject(err);
+                } else {
+                    current.resolve(response);
+                    current = response ? Q.defer() : undefined;
+                }
+            });
+        return handle;
     }
 
 // Local variables:
